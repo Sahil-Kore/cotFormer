@@ -1,0 +1,4 @@
+model_name,total_params,trainable_params,val_ppl,training_time_s,inference_time_ms
+BlockUniversalAdapter,170126592,45686784,42.39,1045.8,2.132
+CoTAdapter,170126592,45686784,41.66,1089.74,2.316
+DeepTransformerAdapter,184302336,59862528,42.07,1094.28,2.206
