@@ -1,5 +1,5 @@
-python3 gpt2_adapters/block_universal.py
+python3 gpt2-medium_adapters/block_universal.py
 sleep 10
-python3 gpt2_adapters/cot_former.py
+python3 gpt2-medium_adapters/cot_former.py
 sleep 10 
-python3 gpt2_adapters/deeper_model.py
+python3 gpt2-medium_adapters/deeper_model.py
