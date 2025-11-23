@@ -9,11 +9,10 @@ import csv
 import os
 import time
 
-# ---------- Config ----------
 BACKBONE = "gpt2"
 SEQ_LEN = 128
 BATCH_SIZE = 4
-NREPEAT = 3  # number of refinement repeats (same CoT layer reused)
+NREPEAT = 3
 LR = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS = 3
@@ -25,7 +24,6 @@ torch.manual_seed(SEED)
 random.seed(SEED)
 
 
-# ---------- CoT single layer (weight-tied) ----------
 class CoTLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim=None, dropout=0.1):
         super().__init__()
@@ -42,29 +40,21 @@ class CoTLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def build_causal_repeat_mask(self, S, R, device):
-        # Create mask of shape (S, S*R) where mask[i, j] = 0 if (j % S) <= i else -inf
         ctx_len = S * R
-        idxs = torch.arange(ctx_len, device=device)  # 0..S*R-1
-        pos_in_block = idxs % S  # position within original sequence
-        # pos_in_block: shape (ctx_len,)
-        # we want broadcast comparison with i in 0..S-1
-        i = torch.arange(S, device=device).unsqueeze(1)  # (S,1)
-        allowed = pos_in_block.unsqueeze(0) <= i  # (S, ctx_len) boolean
+        idxs = torch.arange(ctx_len, device=device)
+        pos_in_block = idxs % S
+        i = torch.arange(S, device=device).unsqueeze(1)
+        allowed = pos_in_block.unsqueeze(0) <= i
         mask = torch.full((S, ctx_len), float("-inf"), device=device)
         mask[allowed] = 0.0
-        return mask  # shape (S, ctx_len)
+        return mask
 
     def forward(self, query, context, key_padding_mask=None):
-        """
-        query: (B, S, D)
-        context: (B, S*R, D) where R = number of concatenated repeats available
-        key_padding_mask: (B, S*R) boolean mask (True -> masked/pad)
-        """
-        q = self.ln1(query)  # pre-LN
+        q = self.ln1(query)
         B, S_q, D = q.shape
         _, S_c, _ = context.shape
         R = S_c // S_q
-        attn_mask = self.build_causal_repeat_mask(S_q, R, q.device)  # (S_q, S_c)
+        attn_mask = self.build_causal_repeat_mask(S_q, R, q.device)
         attn_out, _ = self.mha(
             query=q,
             key=context,
@@ -77,17 +67,14 @@ class CoTLayer(nn.Module):
         return x
 
 
-# ---------- Model wrapper ----------
 class DistilCoTAdapter(nn.Module):
     def __init__(self, backbone_name="distilgpt2", nrepeat=3, freeze_backbone=True):
         super().__init__()
-        # backbone (no LM head)
         self.backbone = GPT2Model.from_pretrained(backbone_name)
         self.config = self.backbone.config
         self.embed_dim = self.config.hidden_size
         self.vocab_size = self.config.vocab_size
 
-        # single CoT layer (weight-tied) matching backbone heads/size
         num_heads = getattr(self.config, "n_head", 8)
         self.cot_layer = CoTLayer(
             self.embed_dim, num_heads=num_heads, ff_dim=self.embed_dim * 4, dropout=0.1
@@ -96,7 +83,6 @@ class DistilCoTAdapter(nn.Module):
         self.nrepeat = nrepeat
         self.post_ln = nn.LayerNorm(self.embed_dim)
 
-        # new trainable LM head initialized from backbone embeddings (clone -> trainable)
         emb_w = self.backbone.get_input_embeddings().weight.detach().clone()
         self.lm_head = nn.Linear(self.embed_dim, emb_w.size(0), bias=False)
         self.lm_head.weight = nn.Parameter(emb_w)
@@ -107,7 +93,6 @@ class DistilCoTAdapter(nn.Module):
             self.backbone.eval()
 
     def forward(self, input_ids, attention_mask=None):
-        # attention_mask: (B, S) with 1 for token, 0 for pad
         if attention_mask is None:
             attention_mask = torch.ones_like(
                 input_ids, dtype=torch.long, device=input_ids.device
@@ -117,31 +102,28 @@ class DistilCoTAdapter(nn.Module):
             out = self.backbone(
                 input_ids=input_ids, attention_mask=attention_mask, return_dict=True
             )
-            h0 = out.last_hidden_state.detach()  # (B, S, D)
+            h0 = out.last_hidden_state.detach()
 
         B, S, D = h0.shape
-        prev = [h0]  # list of (B, S, D)
+        prev = [h0]
         for r in range(self.nrepeat):
-            # context = concat of all previous representations
-            ctx = torch.cat(prev, dim=1)  # (B, S * len(prev), D)
-            # key_padding_mask for context: repeat attention_mask for each block
+            ctx = torch.cat(prev, dim=1)
             num_blocks = len(prev)
-            key_pad = attention_mask.repeat(1, num_blocks)  # (B, S * num_blocks)
+            key_pad = attention_mask.repeat(1, num_blocks)
             key_pad_bool = (
                 key_pad == 0
-            )  # True where padded -> MHA expects True for masked positions
+            )
             query = prev[-1]
             refined = self.cot_layer(
                 query=query, context=ctx, key_padding_mask=key_pad_bool
             )
             prev.append(self.post_ln(refined))
 
-        final_repr = prev[-1]  # (B, S, D)
-        logits = self.lm_head(final_repr)  # (B, S, V)
+        final_repr = prev[-1]
+        logits = self.lm_head(final_repr)
         return logits
 
 
-# ---------- Tokenizer / Dataset ----------
 def prepare_tokenizer(backbone_name=BACKBONE):
     tok = AutoTokenizer.from_pretrained(backbone_name)
     if tok.pad_token is None:
@@ -173,7 +155,6 @@ def build_dataset(tokenizer, seq_len=SEQ_LEN, max_samples=MAX_SAMPLES):
     return data
 
 
-# ---------- Perplexity ----------
 def compute_perplexity_and_time(model, tokenizer, dataset):
     model.eval()
     total_nll = 0.0
@@ -211,7 +192,6 @@ def compute_perplexity_and_time(model, tokenizer, dataset):
     return ppl, avg_time
 
 
-# ---------- Train ----------
 def train_and_log():
     tokenizer = prepare_tokenizer(BACKBONE)
     data = build_dataset(tokenizer, seq_len=SEQ_LEN, max_samples=MAX_SAMPLES)
@@ -222,7 +202,6 @@ def train_and_log():
     model = DistilCoTAdapter(backbone_name=BACKBONE, nrepeat=NREPEAT)
     model.to(DEVICE)
 
-    # --- Parameter counts ---
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -231,7 +210,6 @@ def train_and_log():
 
     print(f"Total Params: {total_params:,} | Trainable: {trainable_params:,}")
 
-    # ---- Training ----
     start_time = time.time()
     model.train()
 
@@ -264,18 +242,15 @@ def train_and_log():
                 print(f"Epoch {epoch} | Step {step} | Avg Loss {total_loss / 50:.4f}")
                 total_loss = 0.0
 
-        # compute validation ppl
         val_ppl, avg_inf_time = compute_perplexity_and_time(model, tokenizer, val_data)
         print(f"Epoch {epoch} | Validation PPL: {val_ppl:.2f}")
 
     training_time = time.time() - start_time
 
-    # ---- Compute inference time ----
     val_ppl, avg_inf_time = compute_perplexity_and_time(model, tokenizer, val_data)
 
     avg_inf_ms = avg_inf_time * 1000
 
-    # ---- Save CSV ----
     results_file = "gpt2_results.csv"
     header = [
         "model_name",
@@ -306,14 +281,13 @@ def train_and_log():
     return model, tokenizer, val_data
 
 
-# ---------- Simple generation (greedy) ----------
 def generate_greedy(model, tokenizer, prompt, max_new_tokens=20):
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
     generated = input_ids
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            logits = model(generated)  # (1, S, V)
+            logits = model(generated)
             next_logits = logits[:, -1, :]
             next_id = next_logits.argmax(dim=-1).unsqueeze(-1)
         generated = torch.cat([generated, next_id], dim=1)
@@ -322,7 +296,6 @@ def generate_greedy(model, tokenizer, prompt, max_new_tokens=20):
     return tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
 
 
-# ---------- Run ----------
 if __name__ == "__main__":
     model, tokenizer, val_data = train_and_log()
     prompt = "In 2025 the field of machine learning"

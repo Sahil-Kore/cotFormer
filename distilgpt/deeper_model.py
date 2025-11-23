@@ -9,11 +9,10 @@ import csv
 import os
 import time
 
-# ---------- Config ----------
 BACKBONE = "distilgpt2"
 SEQ_LEN = 128
 BATCH_SIZE = 8
-NLAYERS = 3                 # number of independent transformer layers
+NLAYERS = 3
 LR = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS = 3
@@ -24,7 +23,6 @@ GRAD_CLIP = 1.0
 torch.manual_seed(SEED)
 random.seed(SEED)
 
-# ---------- Independent transformer block (pre-LN) ----------
 class IndepTransformBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim=None, dropout=0.1):
         super().__init__()
@@ -42,7 +40,6 @@ class IndepTransformBlock(nn.Module):
         return mask
 
     def forward(self, x, key_padding_mask=None):
-        # x: (B, S, D)
         q = self.ln1(x)
         B, S, D = q.shape
         attn_mask = self.build_causal_mask(S, q.device)
@@ -51,7 +48,6 @@ class IndepTransformBlock(nn.Module):
         x = x + self.dropout(self.ff(self.ln2(x)))
         return x
 
-# ---------- Deep Transformer Adapter (stack of independent blocks) ----------
 class DeepTransformerAdapter(nn.Module):
     def __init__(self, backbone_name="distilgpt2", n_layers=3, freeze_backbone=True):
         super().__init__()
@@ -70,7 +66,7 @@ class DeepTransformerAdapter(nn.Module):
 
         emb_w = self.backbone.get_input_embeddings().weight.detach().clone()
         self.lm_head = nn.Linear(self.embed_dim, emb_w.size(0), bias=False)
-        self.lm_head.weight = nn.Parameter(emb_w)  # trainable copy
+        self.lm_head.weight = nn.Parameter(emb_w)
 
         if freeze_backbone:
             for p in self.backbone.parameters():
@@ -83,20 +79,18 @@ class DeepTransformerAdapter(nn.Module):
 
         with torch.no_grad():
             out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            h = out.last_hidden_state.detach()  # (B, S, D)
+            h = out.last_hidden_state.detach()
 
-        key_pad_bool = (attention_mask == 0)  # True where padding -> MHA expects True for masked positions
+        key_pad_bool = (attention_mask == 0)
 
-        # apply each independent block sequentially
         x = h
         for block in self.blocks:
             x = block(x, key_padding_mask=key_pad_bool)
             x = self.post_ln(x)
 
-        logits = self.lm_head(x)  # (B, S, V)
+        logits = self.lm_head(x)
         return logits
 
-# ---------- Tokenizer / Dataset ----------
 def prepare_tokenizer(backbone_name=BACKBONE):
     tok = GPT2TokenizerFast.from_pretrained(backbone_name)
     if tok.pad_token is None:
@@ -115,7 +109,6 @@ def build_dataset(tokenizer, seq_len=SEQ_LEN, max_samples=MAX_SAMPLES):
         data.append({"input_ids": ids[i:i+BATCH_SIZE], "attention_mask": mask[i:i+BATCH_SIZE]})
     return data
 
-# ---------- Perplexity + time ----------
 def compute_perplexity_and_time(model, tokenizer, dataset):
     model.eval()
     total_nll = 0.0
@@ -148,7 +141,6 @@ def compute_perplexity_and_time(model, tokenizer, dataset):
     avg_time = total_t / total_samples
     return ppl, avg_time
 
-# ---------- Train + CSV logging ----------
 def train_and_log():
     tokenizer = prepare_tokenizer(BACKBONE)
     data = build_dataset(tokenizer, seq_len=SEQ_LEN, max_samples=MAX_SAMPLES)
@@ -201,7 +193,6 @@ def train_and_log():
     val_ppl, avg_inf_time = compute_perplexity_and_time(model, tokenizer, val_data)
     avg_inf_ms = avg_inf_time * 1000.0
 
-    # CSV write
     results_file = "distil_results.csv"
     header = ["model_name", "total_params", "trainable_params", "val_ppl", "training_time_s", "inference_time_ms"]
     row = ["DeepTransformerAdapter", total_params, trainable_params, round(val_ppl, 2), round(training_time, 2), round(avg_inf_ms, 3)]
@@ -215,14 +206,13 @@ def train_and_log():
 
     return model, tokenizer, val_data
 
-# ---------- Greedy generation ----------
 def generate_greedy(model, tokenizer, prompt, max_new_tokens=20):
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
     generated = input_ids
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            logits = model(generated)  # (1, S, V)
+            logits = model(generated)
             next_logits = logits[:, -1, :]
             next_id = next_logits.argmax(dim=-1).unsqueeze(-1)
         generated = torch.cat([generated, next_id], dim=1)
@@ -230,7 +220,6 @@ def generate_greedy(model, tokenizer, prompt, max_new_tokens=20):
             break
     return tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
 
-# ---------- Run ----------
 if __name__ == "__main__":
     model, tokenizer, val_data = train_and_log()
     prompt = "In 2025 the field of machine learning"
